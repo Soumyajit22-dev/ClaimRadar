@@ -1,0 +1,14 @@
+
+pydantic-settings
+fastapi
+pydantic-ai
+sqlalchemy
+psycopg2-binary
+python-dotenv
+pdf2image
+Pillow
+tiktoken
+neo4j
+scikit-learn
+numpy
+
