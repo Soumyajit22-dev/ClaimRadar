@@ -13,7 +13,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from agents.tools.webcrawl_tool import fetch_site, SiteDoc
 from agents.tools.search_tool import search_web, SearchResultItem, SearchResults
 from services.neo4j_service import neo4j_service, VerificationResult
-
+from models.base import get_model
 # Add the parent directory to the Python path to allow imports from agent_output
 current_dir = Path(__file__).parent
 parent_dir = current_dir.parent
@@ -21,14 +21,8 @@ sys.path.insert(0, str(parent_dir))
 
 from agents.schema.output import FinalAgentOutput
 
-load_dotenv()
-model = OpenAIModel(
-    "agentic-large",
-    provider=OpenAIProvider(
-        base_url="https://api.theagentic.ai/v1", 
-        api_key='20WsbU31U3eeo9b8cA2ioICnt0PfCdlw'
-    ),
-)
+model, model_settings = get_model()
+
 
 @dataclass
 class Claim_radar_Deps:
@@ -36,8 +30,9 @@ class Claim_radar_Deps:
    
 
 class Claimradar_agent:
-    def __init__(self, model = model):
+    def __init__(self, model = model, m = model_settings):
         self.model = model
+        self.m = m
 
 
     def _read_markdown_file(self, file_path: str) -> str:
@@ -54,7 +49,8 @@ class Claimradar_agent:
             model=self.model,
             system_prompt= system_prompt,
             deps_type = Claim_radar_Deps,
-            output_type=FinalAgentOutput 
+            output_type=FinalAgentOutput,
+            model_settings = self.m
         )
         @agent.tool
         def fetch_site_tool(url: str) -> SiteDoc:

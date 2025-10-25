@@ -1,8 +1,9 @@
 import os
 import requests
+import json
 from typing import Optional, List, Dict
 from pydantic import BaseModel
-
+from configs.config import get_settings
 
 class SearchResultItem(BaseModel):
     url: str
@@ -13,31 +14,62 @@ class SearchResults(BaseModel):
     query: str
     results: List[SearchResultItem]
 
-# Get API key from environment
-SEARCH_API_KEY = os.getenv("SERPAPI_API_KEY", "serp-YOUR-API-KEY")
-
 def search_web(query: str, limit: int = 5) -> List[Dict]:
     """
-    Minimal synchronous search wrapper.
-    Replace the requests.get(...) below with SerpAPI, Bing, or your preferred provider.
-    The function returns a list of dicts like {'url','title','snippet'}.
+    Search the web using Serper API.
+    Returns a list of dicts with 'url', 'title', and 'snippet' keys.
     """
-    if not SEARCH_API_KEY or SEARCH_API_KEY.startswith("serp-YOUR"):
-        # No-key fallback: return empty so agent sees search returned nothing.
+    settings = get_settings()
+    api_key = settings.api_keys.serp_api_key.get_secret_value()
+    
+    if not api_key or api_key == "SERP_API_KEY":
+        print("Warning: Serper API key not configured. Returning empty results.")
         return []
-
-    # Example (placeholder) - adapt to your vendor API (SerpAPI/Bing etc.)
-    endpoint = "https://serpapi.example/search.json"  # <- REPLACE
-    params = {"q": query, "api_key": SEARCH_API_KEY, "num": limit}
-    resp = requests.get(endpoint, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-
-    results = []
-    for r in data.get("organic_results", [])[:limit]:
-        url = r.get("link") or r.get("url")
-        title = r.get("title") or r.get("result_title")
-        snippet = r.get("snippet") or r.get("description")
-        if url:
-            results.append({"url": url, "title": title, "snippet": snippet})
-    return results
+    
+    # Serper API endpoint
+    url = "https://google.serper.dev/search"
+    
+    # Request headers
+    headers = {
+        'X-API-KEY': api_key,
+        'Content-Type': 'application/json'
+    }
+    
+    # Request payload
+    payload = {
+        'q': query,
+        'num': min(limit, 10)  # Serper API max is 10
+    }
+    
+    try:
+        # Make the API request
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status()
+        
+        # Parse the response
+        data = response.json()
+        
+        # Extract search results
+        results = []
+        organic_results = data.get('organic', [])
+        
+        for result in organic_results[:limit]:
+            search_item = {
+                'url': result.get('link', ''),
+                'title': result.get('title', ''),
+                'snippet': result.get('snippet', '')
+            }
+            results.append(search_item)
+        
+        print(f"✅ Serper API search successful: Found {len(results)} results for query: '{query}'")
+        return results
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Serper API request failed: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"❌ Failed to parse Serper API response: {e}")
+        return []
+    except Exception as e:
+        print(f"❌ Unexpected error during search: {e}")
+        return []

@@ -5,17 +5,17 @@ from dotenv import load_dotenv
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
-
-
-
+from configs.config import get_settings
 
 # Individual getter functions
 def _get_openai_model() -> Tuple[OpenAIModel, Optional[ModelSettings]]:
     """Returns OpenAI model and its settings."""
+    load_dotenv()
+    settings = get_settings()
     openai_model = OpenAIModel(
         model_name="gpt-4.1-mini",
         provider=OpenAIProvider(
-            api_key="OPEN_AI_KEY",
+            api_key=settings.api_keys.openai_api_key.get_secret_value(),
         )
     )
     openai_model_settings = ModelSettings(

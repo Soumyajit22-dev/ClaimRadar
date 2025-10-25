@@ -1,7 +1,7 @@
 import os
 from typing import Optional, Dict, Any
 from pydantic import BaseModel
-
+from configs.config import get_settings
 try:
     from firecrawl import FirecrawlApp
 except ImportError:
@@ -22,7 +22,7 @@ class SiteDoc(BaseModel):
 # 2) Firecrawl client initialization
 def _get_firecrawl_client():
     """Initialize Firecrawl client with fallback for different package versions"""
-    api_key = os.environ.get("FIRECRAWL_API_KEY", "your-firecrawl-key")
+    api_key = get_settings().api_keys.firecrawl_api_key.get_secret_value()
     
     if FirecrawlApp is not None:
         return FirecrawlApp(api_key=api_key)
