@@ -12,7 +12,7 @@ router = APIRouter()
 
 settings = get_settings()
 
-@router.post("/process_text", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/process_text", status_code=status.HTTP_201_CREATED)
 async def process(
     request: Request,
     raw_texts: List[str] = [],
@@ -28,17 +28,13 @@ async def process(
         process_agent = Process_agent()
         summarized_md_path = await process_agent.summarize_texts_to_markdown(input_id=input_id, raw_texts=processed_raw_texts)
         try:
-            Claimradar_agent = Claimradar_agent()
-            response_data = await Claimradar_agent.claim_verifier(input_id=input_id, resources=resources, sensitivity=sensitivity, md_path=summarized_md_path)
+            agent_2 = Claimradar_agent()
+            response_data = await agent_2.claim_verifier(input_id=input_id, resources=resources, sensitivity=sensitivity, md_path=summarized_md_path, raw_texts=raw_texts)
             
         except Exception as e:
             raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process raw text: {str(e)}"
-        )
-        response = AgentResponse(
-            id=input_id,
-            success=True
         )
         return response_data
     except Exception as e:

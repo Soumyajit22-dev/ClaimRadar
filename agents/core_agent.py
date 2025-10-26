@@ -1,102 +1,110 @@
-import os
-import json
-import sys
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from pydantic_ai import Agent, RunContext
+from pydantic import Field, BaseModel
+from pydantic_ai.usage import Usage
+from pydantic_ai.models.openai import OpenAIModel
+from dataclasses import dataclass
 from typing import List
 from datetime import datetime
-from dotenv import load_dotenv
-from pydantic_ai import Agent, RunContext
-from pydantic import Field
-from pydantic_ai.models.openai import OpenAIModel
-from pydantic_ai.providers.openai import OpenAIProvider
+import os, json
+from pathlib import Path
+from models.base import get_model
+
 from agents.tools.webcrawl_tool import fetch_site, SiteDoc
 from agents.tools.search_tool import search_web, SearchResultItem, SearchResults
-from services.neo4j_service import neo4j_service, VerificationResult
-from models.base import get_model
-# Add the parent directory to the Python path to allow imports from agent_output
-current_dir = Path(__file__).parent
-parent_dir = current_dir.parent
-sys.path.insert(0, str(parent_dir))
-
 from agents.schema.output import FinalAgentOutput
 
 model, model_settings = get_model()
 
 
-@dataclass
-class Claim_radar_Deps:
-   resources: List[str] = Field(..., description="User recommended trusted sites, on which user trust that their results are always true")
-   
+class Claim_radar_Deps(BaseModel):
+    resources: List[str] = Field(..., description="User-trusted resource URLs for fact-checking")
+
 
 class Claimradar_agent:
-    def __init__(self, model = model, m = model_settings):
+    def __init__(self, model=model, m=model_settings):
         self.model = model
         self.m = m
 
-
     def _read_markdown_file(self, file_path: str) -> str:
-        """Read and return content of markdown file"""
+        """Read markdown file safely."""
         try:
             with open(file_path, 'r', encoding='utf-8') as file:
                 return file.read()
         except Exception as e:
-            return f"Error reading file: {str(e)}"
-        
+            raise RuntimeError(f"Error reading file: {e}")
 
-    async def agent(self, system_prompt: str)-> Agent:
+    async def _create_context(self, resources: List[str]) -> RunContext:
+        """Create RunContext automatically (model + usage + deps)."""
+        ctx = RunContext(
+            model=self.model,
+            deps=Claim_radar_Deps(resources=resources),
+            usage=Usage()
+        )
+        return ctx
+
+    async def _create_agent(self, system_prompt: str) -> Agent:
+        """Internal method to define the agent + tools."""
         agent = Agent(
             model=self.model,
-            system_prompt= system_prompt,
-            deps_type = Claim_radar_Deps,
+            system_prompt=system_prompt,
+            deps_type=Claim_radar_Deps,
             output_type=FinalAgentOutput,
-            model_settings = self.m
+            model_settings=self.m
         )
+
+        # Tool: fetch a site
         @agent.tool
-        def fetch_site_tool(url: str) -> SiteDoc:
-            """Tool the agent can call. Returns typed SiteDoc."""
+        def fetch_site_tool(ctx: RunContext,url: str) -> SiteDoc:
+            """Crawl and return a site's markdown."""
             return fetch_site(url)
+
+        # Tool: search the web
         @agent.tool
-        def search_tool(query: str, limit: int = 5) -> SearchResults:
-            """Tool: run a web search and return typed SearchResults (urls + snippets)."""
+        def search_tool(ctx: RunContext, query: str, limit: int = 5) -> SearchResults:
+            """Perform web search and return structured results."""
             try:
                 raw = search_web(query, limit=limit)
-                items = [SearchResultItem(url=r["url"], title=r.get("title"), snippet=r.get("snippet")) for r in raw]
+                items = [
+                    SearchResultItem(
+                        url=r["url"],
+                        title=r.get("title"),
+                        snippet=r.get("snippet")
+                    ) for r in raw
+                ]
                 return SearchResults(query=query, results=items)
             except Exception as e:
                 raise RuntimeError(f"search_tool failed: {e}")
-        
+
         return agent
-    
-    async def claim_verifier(self, ctx: RunContext[Claim_radar_Deps], resources: List[str], sensitivity:int, input_id: str, md_path: str):
-        
-        try:
-            # Read the markdown content for caching
-            markdown_content = self._read_markdown_file(md_path)
-            
-            # Check for exact match first (same text hash)
-            text_hash = neo4j_service.calculate_text_hash(markdown_content)
-            cached_result = neo4j_service.get_verification_by_hash(text_hash)
-            
-            if cached_result:
-                print(f"🎯 Found exact match for {input_id} - returning cached result")
-                return cached_result
-            
-            # Extract keywords for similarity matching
-            keywords = neo4j_service.extract_keywords(markdown_content)
-            
-            # Check for similar content (70%+ keyword overlap)
-            similar_results = neo4j_service.find_similar_verifications(keywords, threshold=0.7)
-            
-            if similar_results:
-                best_match = similar_results[0]  # Highest similarity
-                print(f"🎯 Found similar content ({best_match['similarity']:.2%} match) for {input_id} - returning cached result")
-                return best_match
-            
-            print(f"🔄 No cached result found for {input_id} - running agent verification")
-            
-            ctx.deps.resources = resources
-            system_prompt = """
+
+    async def claim_verifier(self, resources: List[str], sensitivity: int, input_id: str, md_path: str, raw_texts: List[str] = None):
+        """Main entrypoint — handles verification, caching, and context creation internally."""
+        from services.neo4j_service import neo4j_service, VerificationResult
+
+        # Step 1: Read input markdown
+        markdown_content = self._read_markdown_file(md_path)
+
+        # Step 2: Cache check
+        text_hash = neo4j_service.calculate_text_hash(markdown_content)
+        cached_result = neo4j_service.get_verification_by_hash(text_hash)
+        if cached_result:
+            print(f"🎯 Found cached match for {input_id}")
+            return cached_result
+
+        # Step 3: Keyword-based similarity cache
+        keywords = neo4j_service.extract_keywords(markdown_content)
+        similar_results = neo4j_service.find_similar_verifications(keywords, threshold=0.7)
+        if similar_results:
+            print(f"🎯 Found similar verification for {input_id}")
+            return similar_results[0]
+
+        print(f"🔄 No cache found — running agent for {input_id}")
+
+        # Step 4: Create context (automatically handles model + deps)
+        ctx = await self._create_context(resources)
+
+        # Step 5: Create agent
+        system_prompt = """
 You are a specialized fact-checker and misinformation detection agent focused exclusively on global crises domains. Your role is to verify the accuracy of information related to pandemics, geopolitical conflicts, and climate events by conducting comprehensive research using web search and site crawling tools.
 ## Domain Scope:
 You ONLY fact-check content related to these three critical domains:
@@ -160,6 +168,7 @@ You ONLY fact-check content related to these three critical domains:
    - **Step 3**: Prioritize crawling URLs from `ctx.deps.resources` using `fetch_site_tool`
    - **Step 4**: Cross-reference information from multiple sources
    - **Step 5**: Identify any contradictions or conflicting information
+   - **Step 6**: MANDATORY - Extract the EXACT original passages into misinfo and rightinfo fields
 
 ## Data Collection and Analysis:
 - **From Search Results**: Extract URLs, titles, and snippets for initial assessment
@@ -172,10 +181,25 @@ For domain-relevant content, provide a structured response with:
 
 - **Correctness**: bool - True if the information is accurate and verified, False if it contains misinformation or cannot be verified
 - **Out_of_domain**: bool - True if content is outside the defined domains, False if within scope
-- **misinfo**: str - If misinformation is found, clearly describe what specific false information is present in the input
-- **rightinfo**: str - If misinformation is found, provide the correct, verified information that should replace the misinformation
+- **misinfo_indices**: List[int] - List of 0-based indices of passages that contain misinformation
+- **rightinfo_indices**: List[int] - List of 0-based indices of passages that are factually correct
 - **confidence_score**: str - A score from "0.0" to "1.0" indicating your confidence in the verification ("1.0" = very confident, "0.0" = uncertain)
 - **sources**: List[str] - List of URLs and source names that support your verification findings
+
+## Critical Instructions for index-based classification:
+- **misinfo_indices**: List the 0-based index numbers of passages that contain false information, misleading claims, or unverified rumors
+- **rightinfo_indices**: List the 0-based index numbers of passages that are factually accurate and well-sourced
+- **Index numbering**: Start from 0 for the first passage, 1 for the second, etc.
+- **Example**: If input has 3 passages and passage 0 is correct, passages 1 and 2 are misinformation:
+  - rightinfo_indices: [0]
+  - misinfo_indices: [1, 2]
+
+## MANDATORY: You MUST classify ALL passages by index
+- Do NOT leave misinfo_indices or rightinfo_indices empty
+- Every passage must be classified as either correct or misinformation
+- Use 0-based indexing (first passage = 0, second = 1, etc.)
+- If all passages are correct, put all indices in rightinfo_indices and leave misinfo_indices empty
+- If all passages are incorrect, put all indices in misinfo_indices and leave rightinfo_indices empty
 
 ## Guidelines:
 - ONLY process content related to Global crises like pandemics, geopolitical conflicts, or climate events
@@ -188,51 +212,88 @@ For domain-relevant content, provide a structured response with:
 - Always cite your sources with specific URLs
 - Be objective and evidence-based in your assessments
 - If multiple sources contradict each other, note this in your analysis
-"""
+"""  
 
-            user_input = f"Here is the markdown file content to fact-check: {markdown_content}"
-            print("passed input..")
-            agent = await self.agent(system_prompt=system_prompt)
-            try:
-                response = await agent.run(user_input, deps=ctx.deps)
-                print("agent called..")
-                # Save response to JSON file
-                response_data = response.output
+        agent = await self._create_agent(system_prompt)
+
+        # Step 6: Run agent
+        user_input = f"""TASK: Analyze each numbered passage below and classify them by index.
+
+REQUIRED OUTPUT FORMAT:
+- rightinfo_indices: List of 0-based indices of factually correct passages
+- misinfo_indices: List of 0-based indices of passages containing false information
+
+EXAMPLE:
+If passages are:
+0. "COVID vaccines work"
+1. "Bleach cures COVID"
+2. "Climate change is real"
+
+Then output should be:
+- rightinfo_indices: [0, 2]
+- misinfo_indices: [1]
+
+NUMBERED PASSAGES TO ANALYZE:
+{markdown_content}
+
+MANDATORY RULES:
+1. Use 0-based indexing (first passage = 0, second = 1, etc.)
+2. Classify EVERY passage as either correct or misinformation
+3. Do NOT leave index lists empty
+4. All passages are within global crises domains (pandemics, geopolitical conflicts, climate events)
+5. Use search and fetch tools to verify each claim before categorizing"""
+
+        try:
+            response = await agent.run(user_input)
+            response_data = response.output
+
+            # Step 7: Store in Neo4j
+            # Filter passages based on agent's classification
+            if raw_texts is None:
+                # Fallback to splitting markdown if raw_texts not provided
+                passages = markdown_content.split('\n')
+            else:
+                passages = raw_texts
                 
-                # Store in Neo4j for future caching
-                verification_result = VerificationResult(
-                    input_id=input_id,
-                    keywords=keywords,
-                    correctness=response_data.correctness,
-                    out_of_domain=response_data.out_of_domain,
-                    misinfo=response_data.misinfo,
-                    rightinfo=response_data.rightinfo,
-                    confidence_score=response_data.confidence_score,
-                    sources=response_data.sources,
-                    created_at=datetime.now(),
-                    raw_text_hash=text_hash
-                )
-                
-                # Store in Neo4j
-                neo4j_service.store_verification(verification_result)
-                
-                # Save response to JSON file (backup)
-                responses_dir = os.path.join(parent_dir, "responses")
-                os.makedirs(responses_dir, exist_ok=True)
-                
-                output_path = f'{input_id}_verification.json'
-                full_output_path = os.path.join(responses_dir, output_path)
-                
-                with open(full_output_path, 'w') as f:
-                    json.dump(response_data.model_dump(), f, indent=2)
-                
-                print(f"Saved verification response to: {full_output_path}")
-                return response_data
-                
-            except Exception as e:
-                print(f"Error with agent run: {e}")
-                raise ValueError(f"Failed to process document: {str(e)}")
+            misinfo_passages = [passages[i] for i in response_data.misinfo_indices if i < len(passages)]
+            rightinfo_passages = [passages[i] for i in response_data.rightinfo_indices if i < len(passages)]
             
+            verification_result = VerificationResult(
+                input_id=input_id,
+                keywords=keywords,
+                correctness=response_data.Correctness,
+                out_of_domain=response_data.Out_of_domain,
+                misinfo=" | ".join(misinfo_passages),
+                rightinfo=" | ".join(rightinfo_passages),
+                confidence_score=response_data.confidence_score,
+                sources=response_data.sources,
+                created_at=datetime.now(),
+                raw_text_hash=text_hash
+            )
+            neo4j_service.store_verification(verification_result)
+
+            # Step 8: Save JSON response with filtered passages
+            responses_dir = Path(__file__).parent.parent / "responses"
+            responses_dir.mkdir(parents=True, exist_ok=True)
+            output_path = responses_dir / f"{input_id}_verification.json"
+            
+            # Create response with filtered passages
+            response_with_passages = {
+                "Correctness": response_data.Correctness,
+                "Out_of_domain": response_data.Out_of_domain,
+                "misinfo": " | ".join(misinfo_passages),
+                "rightinfo": " | ".join(rightinfo_passages),
+                "misinfo_indices": response_data.misinfo_indices,
+                "rightinfo_indices": response_data.rightinfo_indices,
+                "confidence_score": response_data.confidence_score,
+                "sources": response_data.sources
+            }
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(response_with_passages, f, indent=2)
+
+            print(f"✅ Saved response to {output_path}")
+            return response_data
+
         except Exception as e:
-            raise ValueError(f"Failed to save response file: {str(e)}")
-        
+            raise RuntimeError(f"Agent verification failed: {e}")

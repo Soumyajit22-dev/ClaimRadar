@@ -11,4 +11,5 @@ tiktoken
 neo4j
 scikit-learn
 numpy
+beautifulsoup4
 
